@@ -1,0 +1,144 @@
+#
+# Lachesis: the app and its PostgreSQL database. Full instructions: docs/install.md
+#
+# Prerequisites (compose does not create them):
+#   1. .env             cp .env.example .env, then set POSTGRES_PASSWORD and LACHESIS_DB_APP_PASSWORD
+#                       (and the rest as needed)
+#   2. secrets/master.key   the master key (KEK): base64 of 32 random bytes, owned by uid 65532
+#        mkdir -p secrets
+#        ( umask 077; openssl rand -base64 32 > secrets/master.key )
+#        sudo chown 65532 secrets/master.key && chmod 600 secrets/master.key
+#      Compose (without swarm) bind-mounts a file secret as it is on the host: the uid and mode
+#      settings of the long secret syntax are ignored, so the file itself must be readable by the
+#      container user (uid 65532) and by nobody else. `docker compose up` fails if the file is
+#      missing. Back the key up separately from the database; without it stored credentials
+#      cannot be decrypted. The path can be changed with LACHESIS_MASTER_KEY_SECRET_FILE.
+#   3. A reachable address: the port is published on loopback only (LACHESIS_PUBLISH_ADDR); put a
+#      TLS reverse proxy in front and set TRUST_PROXY, or publish on one private address.
+#
+#   docker compose pull && docker compose up -d
+# Open LACHESIS_BASE_URL (default http://localhost:8080).
+name: lachesis
+
+
+services:
+  # One-shot: applies the migrations as the database owner (POSTGRES_USER) and creates/grants the
+  # least-privilege role the server runs as (docs/install.md, "Database roles"). Only this container
+  # holds the owner's password; the server never sees it, so a compromised server cannot drop the
+  # audit log's triggers or rewrite its rows.
+  migrate:
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.1.0}}
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://lachesis:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/lachesis?sslmode=disable
+      LACHESIS_DB_APP_ROLE: lachesis_app
+      LACHESIS_DB_APP_PASSWORD: ${LACHESIS_DB_APP_PASSWORD:?set LACHESIS_DB_APP_PASSWORD in .env (openssl rand -hex 16)}
+      # After the migrations the owner prunes audit rows older than this many days (default 365; 0 keeps them forever).
+      LACHESIS_AUDIT_RETENTION_DAYS: ${LACHESIS_AUDIT_RETENTION_DAYS:-}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional, on demand or from cron (docs/install.md, "Audit retention"): prunes audit rows past the
+  # retention period, as the database owner. The application role cannot, by design. Not started by
+  # `docker compose up`:   docker compose run --rm audit-prune [--days N] [--dry-run]
+  audit-prune:
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.1.0}}
+    profiles: ["maintenance"]
+    entrypoint: ["/lachesis", "audit", "prune"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://lachesis:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/lachesis?sslmode=disable
+      LACHESIS_AUDIT_RETENTION_DAYS: ${LACHESIS_AUDIT_RETENTION_DAYS:-}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.1.0}}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # The application role: read/write on the tables, append-only on audit_log, no schema changes.
+      DATABASE_URL: postgres://lachesis_app:${LACHESIS_DB_APP_PASSWORD:?set LACHESIS_DB_APP_PASSWORD in .env (openssl rand -hex 16)}@db:5432/lachesis?sslmode=disable
+      LACHESIS_BASE_URL: ${LACHESIS_BASE_URL:-http://localhost:8080}
+      LACHESIS_BIND: 0.0.0.0:8080
+      LACHESIS_MASTER_KEY_FILE: /run/secrets/lachesis_master_key
+      LACHESIS_SETUP_TOKEN: ${LACHESIS_SETUP_TOKEN:-}
+      LACHESIS_OIDC_ISSUER: ${LACHESIS_OIDC_ISSUER:-}
+      LACHESIS_OIDC_CLIENT_ID: ${LACHESIS_OIDC_CLIENT_ID:-}
+      LACHESIS_OIDC_CLIENT_SECRET_FILE: ${LACHESIS_OIDC_CLIENT_SECRET_FILE:-}
+      LACHESIS_OIDC_ROLE_MAP: ${LACHESIS_OIDC_ROLE_MAP:-}
+      LACHESIS_OIDC_GROUPS_CLAIM: ${LACHESIS_OIDC_GROUPS_CLAIM:-}
+      LACHESIS_LOCAL_ADMINS_ONLY: ${LACHESIS_LOCAL_ADMINS_ONLY:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      # Plan/apply rate limits, events per hour. Unset or empty: the app's defaults (30 / 60 / 120 / 240).
+      LACHESIS_APPLY_RATE_TOKEN: ${LACHESIS_APPLY_RATE_TOKEN:-}
+      LACHESIS_APPLY_RATE_USER: ${LACHESIS_APPLY_RATE_USER:-}
+      LACHESIS_PLAN_RATE_TOKEN: ${LACHESIS_PLAN_RATE_TOKEN:-}
+      LACHESIS_PLAN_RATE_USER: ${LACHESIS_PLAN_RATE_USER:-}
+      LACHESIS_MCP_ENABLED: ${LACHESIS_MCP_ENABLED:-false}
+      LACHESIS_MCP_RATE_TOKEN: ${LACHESIS_MCP_RATE_TOKEN:-}
+      LACHESIS_BEARER_RATE_IP: ${LACHESIS_BEARER_RATE_IP:-}
+      LACHESIS_EGRESS_ALLOW: ${LACHESIS_EGRESS_ALLOW:-}
+      LACHESIS_SECRET_REF_DIRS: ${LACHESIS_SECRET_REF_DIRS:-}
+      LACHESIS_SECRET_REF_ENV_PREFIX: ${LACHESIS_SECRET_REF_ENV_PREFIX:-}
+      LACHESIS_LOG_LEVEL: ${LACHESIS_LOG_LEVEL:-info}
+    secrets:
+      - lachesis_master_key
+    ports:
+      # Plain HTTP: loopback only by default. Put a TLS reverse proxy in front, or set
+      # LACHESIS_PUBLISH_ADDR to one private address.
+      - "${LACHESIS_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
+    healthcheck:
+      test: ["CMD", "/lachesis", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  db:
+    image: postgres:17-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lachesis
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: lachesis
+    volumes:
+      - lachesis-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lachesis -d lachesis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+secrets:
+  lachesis_master_key:
+    file: ${LACHESIS_MASTER_KEY_SECRET_FILE:-./secrets/master.key}
+
+volumes:
+  lachesis-db:

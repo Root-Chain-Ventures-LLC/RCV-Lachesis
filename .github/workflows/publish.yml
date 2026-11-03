@@ -1,0 +1,361 @@
+name: publish
+
+# Publishes a Lachesis release for users. The image is BUILT in a private source repository, which signs it,
+# pushes it to a private staging name, commits the current copy of this repository's files here, uploads every
+# install artifact to a DRAFT release of this repository and then dispatches `publish-release` with the version
+# and the exact image digest. This workflow:
+#
+#   1. copies the image BY DIGEST to the public name (so the package is created by, and linked to, THIS
+#      repository) together with its signature objects, and refuses to succeed unless it pulls ANONYMOUSLY at
+#      the same digest and verifies against the committed cosign.pub;
+#   2. downloads the assets of this repository's own draft release, checks SHA256SUMS against the files and
+#      SHA256SUMS.sig against the COMMITTED cosign.pub (an unsigned release is refused);
+#   3. publishes the draft (title "Lachesis X.Y.Z", empty notes), then downloads every asset anonymously and
+#      compares it with SHA256SUMS;
+#   4. removes every older release and tag, so only the newest stable release is public.
+#
+# Re-running a version that is already published verifies its assets and the image again and changes nothing.
+#
+# GITHUB_TOKEN writes the public package and reads, publishes and prunes this repository's releases (permissions
+# below). The private staging package is read with the optional GHCR_READ_TOKEN secret (a token that can read
+# packages) when it is set, otherwise with GITHUB_TOKEN, which needs the staging package to grant this repository
+# Actions read access. The private repository never gives this repository a credential: it only stages the draft
+# and sends the dispatch with a short-lived app token.
+#
+# Re-run by hand with the workflow_dispatch inputs if a dispatch was missed. A run only ever publishes the
+# version it is given: the checked-out files must be that version's (compose.yaml says so).
+
+on:
+  repository_dispatch:
+    types: [publish-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 0.2.0 (no leading v)'
+        required: true
+      digest:
+        description: 'Digest of the staging lachesis image, sha256:...'
+        required: true
+      prerelease:
+        description: 'Prerelease (does not move :latest, does not prune)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.client_payload.version || github.event.inputs.version }}
+  cancel-in-progress: false
+
+env:
+  STAGING_IMAGE: ghcr.io/root-chain-ventures-llc/lachesis-build
+  PUBLIC_IMAGE: ghcr.io/root-chain-ventures-llc/lachesis
+  # oras and cosign, pinned: each is downloaded from GitHub and refused unless it matches its SHA-256.
+  ORAS_VERSION: '1.3.5'
+  ORAS_SHA256: 'f48a73ea6d026a862c3919fc773da9a8c86fc259c2c737d5baed3b8b9614ad22'
+  COSIGN_VERSION: '3.1.4'
+  COSIGN_SHA256: '424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa'
+
+jobs:
+  publish:
+    # A public repository: GitHub-hosted runners are free and hold no secret of ours.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve and validate the inputs
+        id: in
+        env:
+          # Via env, never interpolated into the script: dispatch inputs are text someone typed.
+          VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+          DIGEST: ${{ github.event.client_payload.digest || github.event.inputs.digest }}
+          PRERELEASE: ${{ github.event.client_payload.prerelease || github.event.inputs.prerelease || 'false' }}
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::version '$VERSION' is not a semantic version without a leading v"; exit 1
+          fi
+          if ! printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::digest '$DIGEST' is not sha256:<64 hex>"; exit 1
+          fi
+          case "$PRERELEASE" in true|false) ;; *) echo "::error::prerelease must be true or false"; exit 1 ;; esac
+          # The sending repository is checked for shape only and never printed: this log is public.
+          if [ -n "$SOURCE_REPO" ] && ! printf '%s' "$SOURCE_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::source_repo is not OWNER/NAME"; exit 1
+          fi
+          if [ -n "$SOURCE_REPO" ] && [ "$SOURCE_REPO" = "$GITHUB_REPOSITORY" ]; then
+            echo "::error::source_repo is this repository: the image is built elsewhere"; exit 1
+          fi
+          # The files in this checkout must be this version's, or the Release would be cut on the wrong commit.
+          if ! grep -Fq "LACHESIS_VERSION:-${VERSION}}" compose.yaml; then
+            echo "::error::the checked-out files are not version $VERSION (compose.yaml names another image tag); the source repository commits them before it dispatches"
+            exit 1
+          fi
+          [ -s cosign.pub ] || { echo "::error::cosign.pub is not committed in this repository"; exit 1; }
+          {
+            echo "version=$VERSION"
+            echo "digest=$DIGEST"
+            echo "prerelease=$PRERELEASE"
+            echo "tag=v$VERSION"
+            echo "head=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing $VERSION (prerelease=$PRERELEASE, source ${SOURCE_SHA:-unknown})"
+
+      - name: Install oras and cosign
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$RUNNER_TEMP/dl"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/dl/oras.tgz" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "${ORAS_SHA256}  $RUNNER_TEMP/dl/oras.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/dl/oras.tgz" -C "$RUNNER_TEMP/bin" oras
+          "$RUNNER_TEMP/bin/oras" version | head -1
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bin/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  $RUNNER_TEMP/bin/cosign" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/bin/cosign" "$RUNNER_TEMP/bin/oras"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Copy the image by digest to the public name, with its signature
+        # GITHUB_TOKEN writes the public package (it is linked to this repository). The private staging
+        # package is read with the GHCR_READ_TOKEN secret when this repository has one, otherwise with
+        # GITHUB_TOKEN too (the staging package then has to grant this repository Actions read access).
+        # oras copies manifests and indexes byte for byte (no media-type conversion), so what users pull has
+        # exactly the digest the private build produced; the check after the copy enforces it. The signature
+        # objects of an image live next to it under the tag sha256-<hex> (an OCI index, which skopeo cannot
+        # write); they stay valid under the new name because they sign the digest, so they are copied too.
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ steps.in.outputs.version }}
+          PRERELEASE: ${{ steps.in.outputs.prerelease }}
+          DIGEST: ${{ steps.in.outputs.digest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cfg="$RUNNER_TEMP/oras-config.json" src="$RUNNER_TEMP/oras-src.json"
+          printf '%s' "$TOKEN" | oras login --registry-config "$cfg" -u "$ACTOR" --password-stdin ghcr.io >/dev/null
+          if [ -n "${SRC_TOKEN:-}" ]; then
+            printf '%s' "$SRC_TOKEN" | oras login --registry-config "$src" -u x --password-stdin ghcr.io >/dev/null
+          else
+            cp "$cfg" "$src"
+          fi
+          trap 'rm -f "$cfg" "$src"' EXIT
+          hex="${DIGEST#sha256:}"
+          oras cp --from-registry-config "$src" --to-registry-config "$cfg" "$STAGING_IMAGE@$DIGEST" "$PUBLIC_IMAGE:$VERSION"
+          got=$(oras manifest fetch --registry-config "$cfg" --descriptor "$PUBLIC_IMAGE:$VERSION" | jq -r .digest)
+          [ "$got" = "$DIGEST" ] || { echo "::error::$PUBLIC_IMAGE:$VERSION is $got after the copy, expected $DIGEST"; exit 1; }
+          tags=$(oras repo tags --registry-config "$src" "$STAGING_IMAGE" | { grep -E "^sha256-${hex}(\.[a-z0-9]+)?\$" || true; })
+          if [ -z "$tags" ]; then
+            echo "::warning::$STAGING_IMAGE@$DIGEST has no signature objects; the signature check below will fail unless the release is signed another way"
+          fi
+          for t in $tags; do
+            oras cp --from-registry-config "$src" --to-registry-config "$cfg" "$STAGING_IMAGE:$t" "$PUBLIC_IMAGE:$t"
+            echo "copied $t"
+          done
+          if [ "$PRERELEASE" = "false" ]; then
+            oras tag --registry-config "$cfg" "$PUBLIC_IMAGE@$DIGEST" latest
+          fi
+
+      - name: Verify the image pulls anonymously at the same digest
+        # The whole point of publishing from here. No credentials of any kind: if the package came out private,
+        # or the copy changed the digest, the release fails now instead of being discovered by the first user.
+        env:
+          VERSION: ${{ steps.in.outputs.version }}
+          PRERELEASE: ${{ steps.in.outputs.prerelease }}
+          DIGEST: ${{ steps.in.outputs.digest }}
+        run: |
+          set -euo pipefail
+          repo="${PUBLIC_IMAGE#ghcr.io/}"
+          resp=$(curl -sS "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io")
+          token=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+          if [ -z "$token" ]; then
+            echo "::error::anonymous registry token request was refused: the package is not public. Response: $resp"
+            echo "::error::Fix: github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/package/${repo##*/} > Package settings > Change visibility > Public, then re-run this workflow."
+            exit 1
+          fi
+          for tag in "$VERSION" $([ "$PRERELEASE" = "false" ] && echo latest); do
+            got=$(curl -sS -o /dev/null -D - \
+              -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/$repo/manifests/$tag" \
+              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest" {print $2}')
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::$PUBLIC_IMAGE:$tag resolves to '${got:-nothing}', expected $DIGEST"
+              exit 1
+            fi
+            echo "$PUBLIC_IMAGE:$tag -> $got (anonymous, matches)"
+          done
+
+      - name: Verify the image signature against the committed key
+        env:
+          DIGEST: ${{ steps.in.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # An empty Docker config: nothing here may authenticate, exactly like a user.
+          export DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker"
+          mkdir -p "$DOCKER_CONFIG"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true "$PUBLIC_IMAGE@$DIGEST" >/dev/null
+          echo "verified the signature of $PUBLIC_IMAGE@$DIGEST"
+
+      - name: Find the release for this version
+        # The source repository stages the release as a DRAFT of this repository before it dispatches, and
+        # a draft is not reachable by tag: look it up in the list. A draft wins; otherwise a published release
+        # of the same tag means this is a re-run, which only verifies it.
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.in.outputs.tag }}
+        run: |
+          set -euo pipefail
+          found=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.id) \(if .draft then \"draft\" else \"published\" end)\"")
+          id=$(printf '%s\n' "$found" | awk '$2 == "draft" {print $1; exit}')
+          state=draft
+          if [ -z "$id" ]; then
+            id=$(printf '%s\n' "$found" | awk '$2 == "published" {print $1; exit}')
+            state=published
+          fi
+          if [ -z "$id" ]; then
+            echo "::error::$GH_REPO has no release for $TAG: the source repository stages it as a draft before it dispatches"; exit 1
+          fi
+          echo "release $id for $TAG is $state"
+          { echo "id=$id"; echo "state=$state"; } >> "$GITHUB_OUTPUT"
+
+      - name: Download the release's assets and verify them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.rel.outputs.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh api --paginate "repos/$GH_REPO/releases/$RELEASE_ID/assets?per_page=100" --jq '.[] | "\(.id) \(.name)"' \
+            | while read -r aid name; do
+                gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$aid" > "assets/$name"
+              done
+          cd assets
+          ls -la
+          for f in SHA256SUMS SHA256SUMS.sig cosign.pub; do
+            if [ ! -s "$f" ]; then
+              echo "::error::the release has no $f: it is unsigned and will not be published"; exit 1
+            fi
+          done
+          # The key the release was signed with must be the key committed here.
+          cmp cosign.pub ../cosign.pub || { echo "::error::the release's cosign.pub differs from the committed cosign.pub"; exit 1; }
+          cosign verify-blob --key ../cosign.pub --signature SHA256SUMS.sig --insecure-ignore-tlog=true SHA256SUMS
+          # Every listed file is present with the listed hash, and nothing unlisted is present.
+          fail=0
+          : > ../listed.txt
+          while read -r sum name; do
+            name="${name#\*}"
+            if [ ! -f "$name" ]; then echo "::error::listed in SHA256SUMS but not in the release: $name"; fail=1; continue; fi
+            if [ "$(sha256sum "$name" | cut -d' ' -f1)" != "$sum" ]; then echo "::error::checksum mismatch: $name"; fail=1; fi
+            echo "$name" >> ../listed.txt
+          done < SHA256SUMS
+          for f in *; do
+            case "$f" in SHA256SUMS|SHA256SUMS.sig) continue ;; esac
+            grep -qxF "$f" ../listed.txt || { echo "::error::in the release but not covered by SHA256SUMS: $f"; fail=1; }
+          done
+          # Only install artifacts are ever published, and all of them must be there.
+          for f in *; do
+            case "$f" in
+              SHA256SUMS|SHA256SUMS.sig|cosign.pub|install-bundle.tar.gz) ;;
+              *) echo "::error::unexpected file in the release: $f"; fail=1 ;;
+            esac
+          done
+          [ -f install-bundle.tar.gz ] || { echo "::error::install-bundle.tar.gz is missing"; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+          echo "verified $(find . -type f | wc -l) assets against the signed SHA256SUMS"
+
+      - name: Publish the release
+        # The draft holds exactly the verified assets (checked here), so publishing it shows nobody a half-uploaded
+        # release. A release that is already published is left as it is: the checks above are its verification.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.rel.outputs.id }}
+          STATE: ${{ steps.rel.outputs.state }}
+          TAG: ${{ steps.in.outputs.tag }}
+          VERSION: ${{ steps.in.outputs.version }}
+          PRERELEASE: ${{ steps.in.outputs.prerelease }}
+          HEAD_SHA: ${{ steps.in.outputs.head }}
+        run: |
+          set -euo pipefail
+          names=$(gh api --paginate "repos/$GH_REPO/releases/$RELEASE_ID/assets?per_page=100" --jq '.[].name' | sort)
+          want=$(cd assets && printf '%s\n' * | sort)
+          [ "$names" = "$want" ] || { echo "::error::the release does not hold exactly the verified assets"; exit 1; }
+          if [ "$STATE" = "published" ]; then
+            echo "$TAG is already published; its assets match the signed checksums, nothing to change"
+          else
+            latest=false
+            if [ "$PRERELEASE" = "false" ]; then latest=true; fi
+            # target_commitish only matters when the tag does not exist yet: it then names this commit.
+            gh api -X PATCH "repos/$GH_REPO/releases/$RELEASE_ID" \
+              -f name="Lachesis $VERSION" -f body="" -f target_commitish="$HEAD_SHA" \
+              -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$latest" >/dev/null
+          fi
+          echo "Released $TAG: https://github.com/$GH_REPO/releases/tag/$TAG"
+
+      - name: Verify the public release anonymously
+        env:
+          TAG: ${{ steps.in.outputs.tag }}
+          VERSION: ${{ steps.in.outputs.version }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          curl -fsS -H 'Accept: application/vnd.github+json' "$api" -o release.json
+          [ "$(jq -r .name release.json)" = "Lachesis $VERSION" ] || { echo "::error::release title is not 'Lachesis $VERSION'"; exit 1; }
+          [ -z "$(jq -r '.body // ""' release.json)" ] || { echo "::error::release notes are not empty"; exit 1; }
+          [ "$(jq -r .draft release.json)" = "false" ] || { echo "::error::release is still a draft"; exit 1; }
+          mkdir -p anon
+          jq -r '.assets[].name' release.json | sort > anon-names.txt
+          (cd assets && printf '%s\n' * | sort) | diff - anon-names.txt || { echo "::error::published assets differ from the verified assets"; exit 1; }
+          while read -r name; do
+            curl -fsSL --retry 3 -o "anon/$name" "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$name"
+            cmp "anon/$name" "assets/$name" || { echo "::error::anonymous download of $name differs from the verified file"; exit 1; }
+          done < anon-names.txt
+          cd anon
+          cosign verify-blob --key ../cosign.pub --signature SHA256SUMS.sig --insecure-ignore-tlog=true SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+          echo "anonymous download of every asset matches the signed checksums"
+
+      # Only the current release stays public: once a stable release is out, delete every other release and
+      # tag in this repository. Skipped for a prerelease, and skipped when a newer version tag already exists
+      # (a backfill of an old version must never remove the newest).
+      - name: Remove older releases and tags
+        if: steps.in.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.in.outputs.tag }}
+        run: |
+          set -euo pipefail
+          newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" --jq '.[].name' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n 1)
+          if [ "$newest" != "$TAG" ]; then
+            echo "::warning::$TAG is not the newest version tag (${newest:-none}); leaving older releases in place"
+            exit 0
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | "\(.id) \(.tag_name)"' \
+            | while read -r id tag; do
+                [ "$tag" = "$TAG" ] && continue
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+                echo "deleted release $tag"
+              done
+          gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" --jq '.[].name' \
+            | while read -r tag; do
+                [ "$tag" = "$TAG" ] && continue
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag"
+                echo "deleted tag $tag"
+              done
