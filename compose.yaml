@@ -27,7 +27,7 @@ services:
   # holds the owner's password; the server never sees it, so a compromised server cannot drop the
   # audit log's triggers or rewrite its rows.
   migrate:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.1.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.2.0}}
     command: ["migrate"]
     restart: "no"
     depends_on:
@@ -49,7 +49,7 @@ services:
   # retention period, as the database owner. The application role cannot, by design. Not started by
   # `docker compose up`:   docker compose run --rm audit-prune [--days N] [--dry-run]
   audit-prune:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.1.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.2.0}}
     profiles: ["maintenance"]
     entrypoint: ["/lachesis", "audit", "prune"]
     restart: "no"
@@ -68,7 +68,7 @@ services:
       - no-new-privileges:true
 
   app:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.1.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.2.0}}
     restart: unless-stopped
     depends_on:
       db:
@@ -97,6 +97,9 @@ services:
       LACHESIS_MCP_ENABLED: ${LACHESIS_MCP_ENABLED:-false}
       LACHESIS_MCP_RATE_TOKEN: ${LACHESIS_MCP_RATE_TOKEN:-}
       LACHESIS_BEARER_RATE_IP: ${LACHESIS_BEARER_RATE_IP:-}
+      # Optional approval webhook (off when the URL is empty). The secret is a file, never a value.
+      LACHESIS_APPROVAL_WEBHOOK_URL: ${LACHESIS_APPROVAL_WEBHOOK_URL:-}
+      LACHESIS_APPROVAL_WEBHOOK_SECRET_FILE: ${LACHESIS_APPROVAL_WEBHOOK_SECRET_FILE:-}
       LACHESIS_EGRESS_ALLOW: ${LACHESIS_EGRESS_ALLOW:-}
       LACHESIS_SECRET_REF_DIRS: ${LACHESIS_SECRET_REF_DIRS:-}
       LACHESIS_SECRET_REF_ENV_PREFIX: ${LACHESIS_SECRET_REF_ENV_PREFIX:-}

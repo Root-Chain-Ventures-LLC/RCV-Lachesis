@@ -35,7 +35,7 @@ usually change:
 | `LACHESIS_SETUP_TOKEN` | At least 16 characters; the only way to create the first administrator without single sign-on (section 7). |
 | `LACHESIS_OIDC_*` | Optional single sign-on (section 7). |
 | `LACHESIS_LOCAL_ADMINS_ONLY` | Restrict password sign-in to administrators. Defaults to `true` when single sign-on is configured, `false` otherwise. |
-| `LACHESIS_MCP_ENABLED`, `LACHESIS_MCP_RATE_TOKEN` | MCP for AI agents, off by default. `true` serves it at `/mcp` for API tokens with the `read` scope (read-only in this version; cookies are not accepted there, and a request that carries an `Origin` must carry this Lachesis's own, so web pages cannot reach it); the rate is messages per minute per token. A request is capped at 64 KiB and JSON-RPC batches are refused. The 403 (not allowed) and 429 (rate limited) answers of MCP travel inside JSON-RPC errors (`-32030`, `-32029`, with the HTTP status in the error data) over HTTP 200, so a proxy or monitor sees them as successful requests; only authentication failures (401, 403 `missing_scope`, `bad_origin`) and oversized or batched bodies use HTTP status codes. A local agent that speaks stdio runs `lachesis mcp --stdio --token-file PATH --url https://lachesis.example.com` (the token file must be mode 0600). |
+| `LACHESIS_MCP_ENABLED`, `LACHESIS_MCP_RATE_TOKEN` | MCP for AI agents, off by default. `true` serves it at `/mcp` for API tokens with the `read` scope (cookies are not accepted there, and a request that carries an `Origin` must carry this Lachesis's own, so web pages cannot reach it); the rate is messages per minute per token. A token with the `plan` or `apply` scope whose owner is an operator or administrator can also plan and apply changes through the MCP write tools (`plan_reservation`, `plan_pool_change`, `plan_option_change`, `get_plan`, `apply_plan`); they go through the same plan engine, approval rules and limits as the REST API, a token can never approve a plan, and (as over REST) any apply-scoped operator can apply any ready plan on servers in the token's allow-list. A request is capped at 64 KiB and JSON-RPC batches are refused. The 403 (not allowed) and 429 (rate limited) answers of MCP travel inside JSON-RPC errors (`-32030`, `-32029` and, for a busy server, `-32031`, with the HTTP status in the error data) over HTTP 200, so a proxy or monitor sees them as successful requests; only authentication failures (401, 403 `missing_scope`, `bad_origin`) and oversized or batched bodies use HTTP status codes. A local agent that speaks stdio runs `lachesis mcp --stdio --token-file PATH --url https://lachesis.example.com` (the token file must be mode 0600). |
 | `LACHESIS_SECRET_REF_DIRS`, `LACHESIS_SECRET_REF_ENV_PREFIX` | Which `file://` and `env://` secret references may resolve (section 8). Unset, file references are off and env references need the `LACHESIS_REF_` prefix. |
 
 `.env` is never baked into the image. The `compose.yaml` of a release runs the image of that release;
@@ -302,6 +302,35 @@ existing hashes are upgraded at the next successful sign-in.
 | `admin` | everything operators can, plus servers, credentials, users, tokens (everyone's), settings and approvals |
 
 Anything a role may not do answers **403**, never an empty list; no session answers **401**.
+
+### 7.4a Approvals queue and the approval webhook
+
+Servers that require approval put their plans in the **Approvals** queue (administrators see a count in the
+navigation). An administrator other than the author approves; any administrator may reject with a reason, and the
+author may reject (withdraw) their own plan. To be told when a plan starts waiting, or is rejected, set:
+
+```
+LACHESIS_APPROVAL_WEBHOOK_URL=https://hooks.example.com/lachesis
+LACHESIS_APPROVAL_WEBHOOK_SECRET_FILE=/run/secrets/lachesis_approval_webhook_secret   # chmod 600, mounted like the OIDC secret
+```
+
+- The message is JSON: `event` (`plan.pending_approval` or `plan.rejected`), `plan_id`, `kind`, `servers` (names),
+  `author` (display name), `expires_at` and `link`. It has no reason text and nothing secret.
+- Verify it. `X-Lachesis-Signature` is `sha256=` plus the hex HMAC-SHA256, keyed with the secret, of this string
+  (the values of three headers, then the raw body, joined by dots):
+
+  ```
+  <X-Lachesis-Timestamp>.<X-Lachesis-Delivery>.<X-Lachesis-Event>.<raw body>
+  ```
+
+  Recompute it, compare in constant time, reject a timestamp older than a few minutes and remember delivery ids for
+  that long, so a replayed delivery is dropped. The delivery and event headers are signed, so a receiver can trust
+  them.
+- The URL may carry a token: it is never logged. Deliveries go through the egress guard. A receiver on a private
+  network (for example `10.x`, `192.168.x`, `172.16-31.x`, a unique-local IPv6 address) works as it is: you chose the
+  URL, so private ranges are allowed. Loopback, link-local (cloud metadata included) and the unspecified address are
+  refused unless their network is in `LACHESIS_EGRESS_ALLOW`. Failed deliveries are retried three times and then
+  audited (`plan.webhook`), repeated failures as one summary row per five minutes.
 
 ### 7.5 Sessions
 
