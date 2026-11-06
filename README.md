@@ -2,8 +2,9 @@
 
 **Lachesis** is a self-hosted, white-label DHCP manager for networks that run more than one kind of DHCP
 server. It gives you one place to see and manage leases, reservations, scopes and pools, and options across
-vendors. This release ships the ISC Kea adapter; every further vendor is added as a separate adapter, and the
-rest of the product never depends on which vendor a server is.
+vendors. This release ships adapters for ISC Kea, Windows Server DHCP, VyOS and UniFi Network, plus an experimental
+Ubiquiti EdgeRouter adapter; every vendor is a separate adapter, and the rest of the product never depends on which
+vendor a server is.
 
 - **Plan, then apply.** Every change is previewed as a plan, can require approval, is applied, and is read back
   from the server to verify it. A write that cannot be verified is reported as unverified, never as a success.
@@ -102,8 +103,9 @@ Upgrade one release at a time when you can.
 ## Documentation
 
 [`docs/README.md`](docs/README.md) indexes the operator documentation: [installing and upgrading](docs/install.md)
-(master key, reverse proxy, sign-in, roles, API tokens, database roles, audit retention) and the
-[Kea adapter](docs/adapters/kea.md).
+(master key, reverse proxy, sign-in, roles, API tokens, database roles, audit retention) and one guide per adapter:
+[Kea](docs/adapters/kea.md), [Windows](docs/adapters/windows.md), [VyOS](docs/adapters/vyos.md),
+[UniFi](docs/adapters/unifi.md) and [EdgeRouter](docs/adapters/edgeos.md) (experimental).
 
 ## Reporting problems
 

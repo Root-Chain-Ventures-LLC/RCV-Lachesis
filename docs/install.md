@@ -36,7 +36,17 @@ usually change:
 | `LACHESIS_OIDC_*` | Optional single sign-on (section 7). |
 | `LACHESIS_LOCAL_ADMINS_ONLY` | Restrict password sign-in to administrators. Defaults to `true` when single sign-on is configured, `false` otherwise. |
 | `LACHESIS_MCP_ENABLED`, `LACHESIS_MCP_RATE_TOKEN` | MCP for AI agents, off by default. `true` serves it at `/mcp` for API tokens with the `read` scope (cookies are not accepted there, and a request that carries an `Origin` must carry this Lachesis's own, so web pages cannot reach it); the rate is messages per minute per token. A token with the `plan` or `apply` scope whose owner is an operator or administrator can also plan and apply changes through the MCP write tools (`plan_reservation`, `plan_pool_change`, `plan_option_change`, `get_plan`, `apply_plan`); they go through the same plan engine, approval rules and limits as the REST API, a token can never approve a plan, and (as over REST) any apply-scoped operator can apply any ready plan on servers in the token's allow-list. A request is capped at 64 KiB and JSON-RPC batches are refused. The 403 (not allowed) and 429 (rate limited) answers of MCP travel inside JSON-RPC errors (`-32030`, `-32029` and, for a busy server, `-32031`, with the HTTP status in the error data) over HTTP 200, so a proxy or monitor sees them as successful requests; only authentication failures (401, 403 `missing_scope`, `bad_origin`) and oversized or batched bodies use HTTP status codes. A local agent that speaks stdio runs `lachesis mcp --stdio --token-file PATH --url https://lachesis.example.com` (the token file must be mode 0600). |
+| `LACHESIS_MCP_OAUTH_DCR`, `LACHESIS_MCP_OAUTH_ACCESS_MINUTES`, `LACHESIS_MCP_OAUTH_REFRESH_DAYS` | OAuth 2.1 for MCP clients (served only with MCP on). A client such as an AI assistant registers itself at `/oauth/register` and sends a person to a consent screen in Lachesis; by default (`approve`) a new client waits on the Tokens page for an administrator, `open` approves it at once and `off` refuses registration. Access tokens last 60 minutes by default and refresh tokens 30 days (each refresh replaces the refresh token; one used twice revokes the grant). The discovery documents are `/.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server`: a reverse proxy must pass them, `/oauth/*` and `/mcp` through to Lachesis. Redirect URIs are https, or http to `localhost`, `127.0.0.1` or `[::1]` only (the three are different hosts; any port). A refresh token used twice revokes the grant, so a client must not send two refreshes at once. Client ID Metadata Documents are not supported yet. API tokens keep working next to it. |
 | `LACHESIS_SECRET_REF_DIRS`, `LACHESIS_SECRET_REF_ENV_PREFIX` | Which `file://` and `env://` secret references may resolve (section 8). Unset, file references are off and env references need the `LACHESIS_REF_` prefix. |
+
+**Settings you can change in the browser.** Fourteen of these variables are also editable by administrators on
+the Settings page: the plan lifetime, the rate limits, MCP on/off and its rate, the approval
+webhook address and signing secret, extra egress networks, audit retention, the log level and password sign-in
+for administrators only. A variable that is **set** (non-empty) in `.env` **locks** that setting on the page,
+which shows "set by `LACHESIS_X`"; leave it out (or empty) to manage it on the page, where a change applies
+without a restart. The signing secret typed on the page is stored encrypted under the master key and is never
+shown again. Single sign-on is a settings group of its own (section 7.2): the `LACHESIS_OIDC_*` variables lock it as a
+whole. Everything else in `.env` (addresses, database, keys, proxies) stays here.
 
 `.env` is never baked into the image. The `compose.yaml` of a release runs the image of that release;
 `LACHESIS_VERSION` in `.env` selects another release (or `latest`), and `LACHESIS_IMAGE` replaces the image
@@ -233,6 +243,17 @@ database (set `role = 'admin'` on an account you control), not by reopening setu
 
 ### 7.2 Single sign-on (OIDC)
 
+Single sign-on is set up **either** in `.env` (below) **or** by an administrator on the Settings page
+(Settings, Single sign-on) - never both. If any `LACHESIS_OIDC_*` variable is set, the page shows the whole
+group locked and names the variables. Without them, enter the issuer, client id, client secret (write-only:
+stored encrypted, never shown again), groups claim and group-to-role map on the page, copy the redirect address
+it shows into the provider, press **Test** (it fetches the provider's discovery document and keys through
+the egress guard and checks the issuer matches exactly) and save. Saving needs a successful test in that
+request, an enabled local administrator (the way back in if the provider fails) and the usual confirmation.
+It applies at once, with no restart; changing the issuer or client id, or turning it off, signs out everyone
+who signed in through the provider (local sessions stay). A provider on loopback or a link-local/metadata
+address is refused by the egress guard.
+
 Any OpenID Connect provider works. Register Lachesis as a **confidential client** that uses the
 **authorization code flow with PKCE** and give it:
 
@@ -264,6 +285,33 @@ LACHESIS_OIDC_ROLE_MAP=admins=admin,netops=operator,readers=viewer
 - Accounts are identified by the provider's issuer and `sub` claim, not by email.
 - The identity provider being down does not stop Lachesis starting; the local administrator
   accounts below keep working.
+
+**Who may change it, and what ends.** Changing the provider needs the **break-glass (local) administrator**
+signed in within the last 10 minutes: the issuer, client id, client secret, groups claim, switching it on, or a
+role map that maps any group to administrator. Role-map entries for operator or viewer need no step-up. An administrator who signed in through single sign-on gets
+`403 step_up_required` (the page tells them to use the break-glass account), so a compromised provider cannot
+make itself permanent. Switching it off, and role maps without an administrator entry, are open to any
+administrator. A new issuer or client id needs the client secret entered again in the same request: the stored
+secret belongs to the previous provider and is deleted, never sent to another. A single sign-on account counts
+only under the issuer in force: sessions and API tokens of accounts from any other issuer are refused (and all of
+them while single sign-on is off); the Users page shows each account's issuer and offers "Disable all accounts of
+other issuers". A change of the role map or groups claim signs everyone out of single sign-on and their API tokens
+wait until their owners sign in again.
+
+**Recovery: `lachesis sso reset --yes`.** If a wrong issuer, client secret or role map locks people out and no
+administrator can reach the Settings page, sign in with the break-glass account (local administrators keep working
+while single sign-on is on) and switch it off or fix it on the Settings page. If even that is impossible, run on the
+host, with the owner connection (`MIGRATE_DATABASE_URL`, else `DATABASE_URL`):
+
+```
+docker compose run --rm sso-reset --yes     # or, outside compose: lachesis sso reset --yes
+```
+
+It refuses to run as the application role (the connection must own the schema) and warns when no enabled local
+administrator remains. It removes every `oidc_*` setting and the stored client secret, ends all single sign-on sessions and sign-ins in
+progress, and writes a `settings.sso_reset` audit row. Local accounts and sessions are not touched. If
+`LACHESIS_OIDC_*` variables are set in `.env`, they keep managing single sign-on: remove them and restart. Then sign in
+with a local administrator and set single sign-on up again.
 
 ### 7.3 Local accounts (break-glass)
 
@@ -408,7 +456,7 @@ long to keep rows. What happens, and what to do:
 
 1. **Automatically at every deploy.** The one-shot `migrate` container (the owner) prunes rows older than the
    retention after applying migrations and the grants. A prune failure is logged as a warning and does not stop
-   the server from starting. Set `LACHESIS_AUDIT_RETENTION_DAYS` in `.env` (the compose file passes it to
+   the server from starting. Set `LACHESIS_AUDIT_RETENTION_DAYS` in `.env` (which locks it on the Settings page; unset, the value saved there is used; the compose file passes it to
    `migrate` and `audit-prune`).
 2. **On a schedule.** A server that is rarely redeployed needs the same run on a timer. Add to cron or a systemd
    timer (daily is plenty):

@@ -27,7 +27,7 @@ services:
   # holds the owner's password; the server never sees it, so a compromised server cannot drop the
   # audit log's triggers or rewrite its rows.
   migrate:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.2.1}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
     command: ["migrate"]
     restart: "no"
     depends_on:
@@ -38,6 +38,7 @@ services:
       LACHESIS_DB_APP_ROLE: lachesis_app
       LACHESIS_DB_APP_PASSWORD: ${LACHESIS_DB_APP_PASSWORD:?set LACHESIS_DB_APP_PASSWORD in .env (openssl rand -hex 16)}
       # After the migrations the owner prunes audit rows older than this many days (default 365; 0 keeps them forever).
+      # Unset or empty: the value saved on the Settings page applies, else 365. Set, it locks that setting.
       LACHESIS_AUDIT_RETENTION_DAYS: ${LACHESIS_AUDIT_RETENTION_DAYS:-}
     read_only: true
     cap_drop:
@@ -49,7 +50,7 @@ services:
   # retention period, as the database owner. The application role cannot, by design. Not started by
   # `docker compose up`:   docker compose run --rm audit-prune [--days N] [--dry-run]
   audit-prune:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.2.1}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
     profiles: ["maintenance"]
     entrypoint: ["/lachesis", "audit", "prune"]
     restart: "no"
@@ -67,8 +68,29 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Recovery (docs/install.md, 7.2): removes the single sign-on configuration stored on the Settings page and
+  # ends single sign-on sessions, as the database owner. Not started by `docker compose up`:
+  #   docker compose run --rm sso-reset --yes
+  sso-reset:
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
+    profiles: ["maintenance"]
+    entrypoint: ["/lachesis", "sso", "reset"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://lachesis:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/lachesis?sslmode=disable
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   app:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.2.1}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
     restart: unless-stopped
     depends_on:
       db:
@@ -89,13 +111,20 @@ services:
       LACHESIS_OIDC_GROUPS_CLAIM: ${LACHESIS_OIDC_GROUPS_CLAIM:-}
       LACHESIS_LOCAL_ADMINS_ONLY: ${LACHESIS_LOCAL_ADMINS_ONLY:-}
       TRUST_PROXY: ${TRUST_PROXY:-}
+      # Settings an administrator can also change on the Settings page: a variable that is SET here
+      # (non-empty) locks its setting there; unset or empty leaves it to the page and the default.
+      LACHESIS_AUDIT_RETENTION_DAYS: ${LACHESIS_AUDIT_RETENTION_DAYS:-}
+      LACHESIS_PLAN_TTL_MINUTES: ${LACHESIS_PLAN_TTL_MINUTES:-}
       # Plan/apply rate limits, events per hour. Unset or empty: the app's defaults (30 / 60 / 120 / 240).
       LACHESIS_APPLY_RATE_TOKEN: ${LACHESIS_APPLY_RATE_TOKEN:-}
       LACHESIS_APPLY_RATE_USER: ${LACHESIS_APPLY_RATE_USER:-}
       LACHESIS_PLAN_RATE_TOKEN: ${LACHESIS_PLAN_RATE_TOKEN:-}
       LACHESIS_PLAN_RATE_USER: ${LACHESIS_PLAN_RATE_USER:-}
-      LACHESIS_MCP_ENABLED: ${LACHESIS_MCP_ENABLED:-false}
+      LACHESIS_MCP_ENABLED: ${LACHESIS_MCP_ENABLED:-}
       LACHESIS_MCP_RATE_TOKEN: ${LACHESIS_MCP_RATE_TOKEN:-}
+      LACHESIS_MCP_OAUTH_DCR: ${LACHESIS_MCP_OAUTH_DCR:-}
+      LACHESIS_MCP_OAUTH_ACCESS_MINUTES: ${LACHESIS_MCP_OAUTH_ACCESS_MINUTES:-}
+      LACHESIS_MCP_OAUTH_REFRESH_DAYS: ${LACHESIS_MCP_OAUTH_REFRESH_DAYS:-}
       LACHESIS_BEARER_RATE_IP: ${LACHESIS_BEARER_RATE_IP:-}
       # Optional approval webhook (off when the URL is empty). The secret is a file, never a value.
       LACHESIS_APPROVAL_WEBHOOK_URL: ${LACHESIS_APPROVAL_WEBHOOK_URL:-}
@@ -103,7 +132,7 @@ services:
       LACHESIS_EGRESS_ALLOW: ${LACHESIS_EGRESS_ALLOW:-}
       LACHESIS_SECRET_REF_DIRS: ${LACHESIS_SECRET_REF_DIRS:-}
       LACHESIS_SECRET_REF_ENV_PREFIX: ${LACHESIS_SECRET_REF_ENV_PREFIX:-}
-      LACHESIS_LOG_LEVEL: ${LACHESIS_LOG_LEVEL:-info}
+      LACHESIS_LOG_LEVEL: ${LACHESIS_LOG_LEVEL:-}
     secrets:
       - lachesis_master_key
     ports:
