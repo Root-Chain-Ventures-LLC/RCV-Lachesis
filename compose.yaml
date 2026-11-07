@@ -27,7 +27,7 @@ services:
   # holds the owner's password; the server never sees it, so a compromised server cannot drop the
   # audit log's triggers or rewrite its rows.
   migrate:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.4.0}}
     command: ["migrate"]
     restart: "no"
     depends_on:
@@ -50,7 +50,7 @@ services:
   # retention period, as the database owner. The application role cannot, by design. Not started by
   # `docker compose up`:   docker compose run --rm audit-prune [--days N] [--dry-run]
   audit-prune:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.4.0}}
     profiles: ["maintenance"]
     entrypoint: ["/lachesis", "audit", "prune"]
     restart: "no"
@@ -72,7 +72,7 @@ services:
   # ends single sign-on sessions, as the database owner. Not started by `docker compose up`:
   #   docker compose run --rm sso-reset --yes
   sso-reset:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.4.0}}
     profiles: ["maintenance"]
     entrypoint: ["/lachesis", "sso", "reset"]
     restart: "no"
@@ -90,7 +90,7 @@ services:
       - no-new-privileges:true
 
   app:
-    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.3.0}}
+    image: ${LACHESIS_IMAGE:-ghcr.io/root-chain-ventures-llc/lachesis:${LACHESIS_VERSION:-0.4.0}}
     restart: unless-stopped
     depends_on:
       db:

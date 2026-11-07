@@ -10,6 +10,13 @@ DHCPv4 only (EdgeOS's `dhcpv6-server` is a different tree and is not covered).
 > field and status code the adapter relies on, which sources agree, and which are inferred. Live validation on
 > a non-production EdgeRouter is a tracked follow-up; until it is done, treat every write as
 > experimental. A write the adapter cannot confirm is never reported as a success (see "Writes").
+>
+> **EdgeOS 3.x (3.0.0, 3.0.1) is unvalidated** (tracked as an open validation task). Nothing in the adapter refuses a firmware version; an unknown or newer
+> release is a probe warning (see "Firmware versions"). No document found describes a change to the web API or to commit-confirm in 3.x,
+> and none of this was checked on hardware (F39).
+>
+> The **SSH transport** (`transport: ssh`) is also **experimental and not validated on EdgeOS**: its protocol was exercised only
+> against a VyOS simulator, which is a sibling system, not EdgeOS (F27 to F38 say which facts were observed there and which are inferred).
 
 ## Sources
 
@@ -25,12 +32,20 @@ DHCPv4 only (EdgeOS's `dhcpv6-server` is a different tree and is not covered).
 | S8 | Ubiquiti UISP help centre, "EdgeRouter - DHCP Server Using Dnsmasq" and "... Static Mapping" | **seen only as search-result summaries** (the site refused the fetch); used for CLI names only |
 | S9 | Teldat OSDx documentation, "DHCP failover" (a Vyatta-family system, **not EdgeOS**) | **seen only as a search-result summary**; the only evidence for the `failover` block |
 
+| S10 | VyOS forum, ["How do I cancel a commit-confirm if the commit fails?"](https://forum.vyos.io/t/how-do-i-cancel-a-commit-confirm-if-the-commit-fails/17151) | VyOS (not EdgeOS): quotes the prompt "commit-confirm will automatically reboot in N minutes unless changes are confirmed", the reboot on timeout, and a device that rebooted after a commit that failed. **Seen only as a search-result summary** |
+| S11 | [juanico10/Ubiquiti](https://github.com/juanico10/Ubiquiti) (a Spanish-language EdgeRouter guide) | says `commit-confirm` reboots the device after 10 minutes by default unless `confirm` is run. **Seen only as a search-result summary** |
+| S12 | [HostiFi, "Ubiquiti finally releases EdgeRouter 3.0 with brand new design"](https://www.hostifi.com/blog/ubiquiti-finally-releases-edgerouter-3-0-with-brand-new-design) | EdgeOS 3.0: redesigned web interface, WireGuard. Names no API change. **Search-result summary only** |
+| S13 | [chromic.org, "EdgeRouter ER-X Firmware v3.0.1"](https://chromic.org/blog/erx-firmware-v301/) | dates: v3.0.0 2025-07-29, v3.0.1 2025-10-30 (ER-X, ER-X-SFP, EP-R6, ER-10X); one upgrade report from v2.0.9-hotfix.7, no API or CLI details (fetched) |
+| S14 | [beyondcloud.solutions, EdgeOS v3 release](https://beyondcloud.solutions/edgeos-v3-release-wireguard-vpn-new-ui-ubiquitis-bold-new-era) | third-party summary of 3.0: new UI, WireGuard, opt-in analytics. Names no API change. **Search-result summary only** |
+| S15 | community gist (dabrovnijk) and the [UISP help article "EdgeRouter - How to Find the Base MAC Address"](https://help.uisp.com/hc/en-us/articles/22591166862743-EdgeRouter-How-to-Find-the-Base-MAC-Address) | example `show version` output: `Version:`, `Build ID:`, `HW model:`, `HW S/N:` lines (v1.10.x and a newer EdgeRouter 4). **Search-result summaries only** |
+| S16 | direct observation on the a VyOS simulator (rolling release; **not EdgeOS**), 2026-11-07 | the CLI, the configure session, the commit-confirm prompt and the rollback, driven by the shared SSH package (see "What the VyOS simulator did and did not prove") |
+
 S1 and S2 are not independent (S1 says it took a subset from S2). S3 is S2's author's client. S4, S5 and S6 are
 independent of them and of each other.
 
 ## Transport and authentication
 
-Everything goes over HTTPS to the router's web interface. The adapter accepts an `https://host[:port]` endpoint and
+With the default `web` transport everything goes over HTTPS to the router's web interface (the `ssh` transport is described under "SSH transport"). The adapter accepts an `https://host[:port]` endpoint and
 nothing else: a path, a query, credentials in the URL or plain `http` are refused, because the login form carries the
 password.
 
@@ -99,7 +114,7 @@ Connection settings:
   (S1, S2). The release is read from `v<release>` (`2.0.9-beta.3`), `Details["product"]`/`["model"]` from the first two parts,
   `Details["firmware"]` is the full string. An endpoint whose `sys_info` is not that JSON, or whose version does not start
   with `Edge`, is reported `OK=false` with every capability unavailable and the reason (not an error).
-  A 1.x release, or a version string of another shape, adds a warning: the shapes are documented for 2.x.
+  A 1.x release, a release newer than 2.x (3.0.0, 3.0.1: unvalidated), or a version string of another shape, adds a warning: the shapes are documented for 2.x. A version is never a refusal (see "Firmware versions").
 - **The DHCP server**: `Details["dhcp_backend"]` is `isc` or `dnsmasq` (`use-dnsmasq`), `Details["dhcp_server"]`
   `enabled`/`disabled` (`service dhcp-server disabled true`; the scopes are then shown as disabled).
 - **Experimental**: until that validation is done, the first warning is `EXPERIMENTAL: ...`, `Details["status"]` is `experimental` and the
@@ -229,6 +244,75 @@ changes, so it never overwrites the rest of the configuration; the re-read tells
   and the lease table (`dhcp_leases`) is not documented for dnsmasq (S7 says the CLI status commands are unsupported under it) and may be empty or
   incomplete. Probe says so (`Details["dhcp_backend"] = "dnsmasq"`, a warning). Configuration reads and writes are the same.
 
+## SSH transport (experimental)
+
+A per-server setting `transport` chooses how Lachesis talks to the router: `web` (the default; everything above) or `ssh`. The server's
+endpoint stays the router's `https://host[:port]` (it names the host); with `ssh` the TLS settings are not used and the SSH host key is
+pinned instead. The SSH port (default 22) is declared to the egress guard as an extra destination. The connection is opened by
+`Deps.Dialer`, so it works directly and through a relay; SSH itself is `golang.org/x/crypto/ssh` run over that connection by a shared SSH package.
+
+Settings (schema-driven connection form, no migration): `transport`, `ssh_host_key`, `ssh_port`, `commit_confirm_minutes` (default 5, 1 to 30).
+Credentials: the username plus a password **or** an SSH private key (and its passphrase). The web transport still requires a password.
+
+### Host keys
+
+`ssh_host_key` holds one or more SHA-256 fingerprints (`SHA256:...` as `ssh-keygen -lf` prints, or 64 hex digits). With none set, connecting
+fails **before any credential is offered**, and the error says which key type and fingerprint the router presented, so an administrator can
+compare it with the router and approve it. There is no trust on first use. A key that differs from the pins is a separate error, never
+treated as "unapproved".
+
+### Reads
+
+| Data | Command (run through the router's login shell) |
+|---|---|
+| firmware | `/opt/vyatta/bin/vyatta-op-cmd-wrapper show version` (`Version:`, `HW model:`) |
+| DHCP configuration | `show configuration commands`, filtered **on the router** (`grep`) to `set service dhcp-server ...`, so the rest of the configuration (hashes, keys) never leaves it; the wrapper's exit status is echoed into the stream so an empty answer is told from a failed one |
+| leases | `show dhcp leases` (table: address, hardware address, expiration, pool, client name) |
+
+The `set` lines are parsed into the same object tree `get.json` yields, so scopes, reservations, planning and verification are the same code
+as the web transport. Probe reports `Details["transport"] = "ssh"` and the capability mode `ssh`.
+
+### Writes: commit-confirm
+
+One configure session per write, driven through a non-interactive `/bin/vbash -s` with a marker after every line (so no prompt has to be
+recognised and the router cannot forge the end of an answer):
+
+1. `source /opt/vyatta/etc/functions/script-template`, `configure`
+2. the plan's `delete` lines, then its `set` lines (a configure session applies lines in order, so unlike the web batch the order of a delete and a
+   set of the same node is defined). Names and values are validated by the planner and checked again against a conservative character set
+   before they reach a command line. A `set` or `delete` the router rejects: `discard`, `ErrInvalidInput`, nothing was committed.
+3. `commit-confirm <N> <<< y` (the prompt "Proceed ? [Y/n]" reads standard input; the here-string answers it)
+4. **read back on a separate channel** and check the plan's expected end state
+5. only if it matches: `confirm`, then `save`, then read back again. Confirmed only when all of that succeeded.
+
+| What happened | Result |
+|---|---|
+| connection lost, or a line rejected, before commit-confirm | error; nothing was committed (the candidate configuration dies with the session) |
+| the commit reported failure | `ErrInvalidInput` saying the change was **not confirmed** and the router will undo anything it applied (a commit may apply part of a change before it fails, so the timer is deliberately not cancelled) |
+| connection lost during commit-confirm | unconfirmed; the note says whether a read-back shows the change, that nothing was confirmed or saved, and that the router will undo it |
+| the read-back fails or does not show the change | unconfirmed, **left pending on purpose**: the router undoes the change when the window ends |
+| `confirm` refused or lost after a good read-back | unconfirmed: live until the window ends, not saved |
+| confirmed, `save` failed or lost | unconfirmed: live and confirmed, a reboot may undo it |
+| confirmed and saved, final read-back shows the change | confirmed |
+
+**What "rolls back" means on EdgeOS (inferred, F33):** `commit-confirm` does not restore the old configuration in place. When the window ends the
+router **reboots** into its saved configuration (S10, S11, and observed on the simulator). A write that is left unconfirmed therefore costs a router
+reboot, and any running change that was never saved is lost with it. This is why the window is five minutes by default and why nothing here retries
+a commit-confirm. The result's `Native` says `commit_confirm: left pending | confirmed`.
+
+### Firmware versions
+
+No code path refuses a firmware version. The web probe refuses only a device that is not EdgeOS at all (no `sys_info`, or a software string that does
+not start with `Edge`); the SSH probe the same with `show version`. An unparsable version, a 1.x release, and now any release newer than 2.x
+(3.0.0, 3.0.1) are **warnings** and the capabilities are unchanged. Session handling has no version logic either: the login, cookies and CSRF handling are
+the documented 2.x shapes, and a 3.x device that answers differently fails the same checks a broken device would (a login that is not a 303 with
+cookies is `ErrAuthFailed`/`ErrUnreachable`, a non-JSON answer is "not the EdgeOS API"), with a message, not a version refusal.
+
+**EdgeOS 3.0.1 is unvalidated (tracked as an open validation task).** What the sources say about 3.x (S12 to S14): 3.0.0 is dated 2025-07-29 and 3.0.1 2025-10-30 (ER-X family at least),
+with a redesigned web interface, WireGuard and opt-in analytics. **None describes a change to `/api/edge/*`, the login, the CSRF token or `commit-confirm`.**
+Absence of a documented change is not evidence of no change: it is unverified on hardware (F39).
+
+
 ## Quirks
 
 - **Lease times**: the lease table has an `expiration` ("2020/06/08 13:07:17", S2) and no start. The zone is not documented; the adapter assumes UTC.
@@ -278,4 +362,18 @@ real device.
 | F24 | status code of a CSRF or rights failure on a POST | none | **Inferred** (401/403 handled) |
 | F25 | `use-dnsmasq`: ISC-only settings (failover, free-form parameters) are ignored; CLI status is unsupported; lease table content unknown | S7, S8 (summary) | Single / **Inferred** for the lease table |
 | F26 | `failover { local-address, peer-address, name, status }` under a subnet | S9 (Vyatta family, summary) | **Inferred** |
+| F27 | over SSH, `/opt/vyatta/bin/vyatta-op-cmd-wrapper <op command>` runs an operational command as an exec request | VyOS simulator (S16) only | **Inferred** for EdgeOS |
+| F28 | `show configuration commands` prints one `set <path> '<value>'` line per leaf (values single-quoted, names not, flags without a value, multi-valued leaves repeated) | VyOS simulator (S16) only | **Inferred** for EdgeOS |
+| F29 | `show version` prints `Version:` and `HW model:` lines | S15 (v1.10.x and a newer EdgeRouter 4; **not v2.x**) | Single / **Inferred** for 2.x and 3.x |
+| F30 | `show dhcp leases` prints a table: address, hardware address, `YYYY/MM/DD HH:MM:SS` expiration, pool, client name; the pool column equals the shared-network name | none (the fields are those of F12 plus the pool; the column layout is a guess) | **Inferred** |
+| F31 | `/bin/vbash -s` with `source /opt/vyatta/etc/functions/script-template` then `configure` gives a configure session with `set`, `delete`, `commit-confirm`, `confirm`, `save`, `discard` | VyOS simulator (S16) only | **Inferred** for EdgeOS |
+| F32 | `commit-confirm <N>` asks "Proceed ? [Y/n]" on standard input, answered by `<<< y` | S10 (prompt text), VyOS simulator (S16) | Single / **Inferred** for EdgeOS |
+| F33 | when the window ends without `confirm`, the router **reboots** into its saved configuration (it does not restore in place); default window 10 minutes | S10, S11, VyOS simulator (S16, text "before reboot") | Multi (VyOS, community guide) / **Inferred** for EdgeOS 2.x and 3.x |
+| F34 | the commit-confirm timer is system-wide, not tied to the SSH session: closing the channel does not cancel it, and `confirm` works from another session | VyOS simulator (S16) only | **Inferred** for EdgeOS |
+| F35 | `commit-confirm` leaves a background process on the channel, so the channel does not reach EOF; output is therefore read up to a marker, not to EOF | VyOS simulator (S16) only | **Inferred** for EdgeOS |
+| F36 | a rejected `set`/`delete` or a failed commit has a non-zero exit status and/or the words "failed", "invalid", "not valid" or "error" in its output | none observed (the adapter checks both, and is conservative: either one is a failure) | **Inferred** |
+| F37 | a commit that failed may still leave the reboot timer armed, and may have applied part of the change | S10 (one report) | Single / **Inferred** for EdgeOS |
+| F38 | the login shell of the admin account is `vbash`, and exec requests are accepted for it | VyOS simulator (`$SHELL` is `/bin/vbash`, S16) | **Inferred** for EdgeOS |
+| F39 | EdgeOS 3.0.0 and 3.0.1 keep the 2.x web API, login, CSRF token and commit-confirm unchanged | S12 to S14 mention a new UI and WireGuard and no API change; absence of evidence only | **Inferred**, unverified on hardware |
+| F40 | the router's SSH server offers key-exchange, cipher and host-key algorithms the Go library accepts by default (not SHA-1-only `ssh-rsa`) | none | **Inferred** |
 
