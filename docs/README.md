@@ -8,6 +8,7 @@
 | VyOS adapter | [`adapters/vyos.md`](adapters/vyos.md) | VyOS 1.4 and later over the HTTPS API: API key, TLS pinning, high-availability pairs, commit and save, lease time zones, capabilities and vendor quirks |
 | UniFi adapter | [`adapters/unifi.md`](adapters/unifi.md) | UniFi Network application: local account, site, TLS pinning, fixed IPs and DHCP ranges, writes the controller discards, DHCP-off networks; UniFi OS console mode is experimental |
 | EdgeRouter adapter (experimental) | [`adapters/edgeos.md`](adapters/edgeos.md) | Ubiquiti EdgeOS: the undocumented web API and the source for every fact used, TLS pinning, static mappings, ranges and options; not yet validated on real firmware |
+| Network facts from Seshat | [`integrations/seshat.md`](integrations/seshat.md) | Seshat's Device Tracker as an optional, read-only information source: the integration client and token, mapping servers and scopes to sites, the facts next to leases and reservations, plan checks, the drift report, the MCP tools, degraded states, caching and rate limits |
 
 Lachesis runs as one container image plus PostgreSQL, wired together by the `compose.yaml` in the root of this
 repository.
