@@ -38,6 +38,7 @@ usually change:
 | `LACHESIS_MCP_ENABLED`, `LACHESIS_MCP_RATE_TOKEN` | MCP for AI agents, off by default. `true` serves it at `/mcp` for API tokens with the `read` scope (cookies are not accepted there, and a request that carries an `Origin` must carry this Lachesis's own, so web pages cannot reach it); the rate is messages per minute per token. A token with the `plan` or `apply` scope whose owner is an operator or administrator can also plan and apply changes through the MCP write tools (`plan_reservation`, `plan_pool_change`, `plan_option_change`, `get_plan`, `apply_plan`); they go through the same plan engine, approval rules and limits as the REST API, a token can never approve a plan, and (as over REST) any apply-scoped operator can apply any ready plan on servers in the token's allow-list. A request is capped at 64 KiB and JSON-RPC batches are refused. The 403 (not allowed) and 429 (rate limited) answers of MCP travel inside JSON-RPC errors (`-32030`, `-32029` and, for a busy server, `-32031`, with the HTTP status in the error data) over HTTP 200, so a proxy or monitor sees them as successful requests; only authentication failures (401, 403 `missing_scope`, `bad_origin`) and oversized or batched bodies use HTTP status codes. A local agent that speaks stdio runs `lachesis mcp --stdio --token-file PATH --url https://lachesis.example.com` (the token file must be mode 0600). |
 | `LACHESIS_MCP_OAUTH_DCR`, `LACHESIS_MCP_OAUTH_ACCESS_MINUTES`, `LACHESIS_MCP_OAUTH_REFRESH_DAYS` | OAuth 2.1 for MCP clients (served only with MCP on). A client such as an AI assistant registers itself at `/oauth/register` and sends a person to a consent screen in Lachesis; by default (`approve`) a new client waits on the Tokens page for an administrator, `open` approves it at once and `off` refuses registration. Access tokens last 60 minutes by default and refresh tokens 30 days (each refresh replaces the refresh token; one used twice revokes the grant). The discovery documents are `/.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server`: a reverse proxy must pass them, `/oauth/*` and `/mcp` through to Lachesis. Redirect URIs are https, or http to `localhost`, `127.0.0.1` or `[::1]` only (the three are different hosts; any port). A refresh token used twice revokes the grant, so a client must not send two refreshes at once. API tokens keep working next to it. |
 | `LACHESIS_MCP_OAUTH_CIMD` | Client ID Metadata Documents, **off by default**: let an application identify itself with the https address of a small JSON document it publishes (the way the current MCP specification prefers) instead of registering. `approve` fetches the document through the egress guard (https on port 443, no redirect, 8 KiB, five seconds; private, loopback and every other special-purpose address are always refused, whatever `LACHESIS_EGRESS_ALLOW` says) and the application then waits on the Tokens page for an administrator, which shows where it comes from; `open` approves it as soon as the document is valid. The consent screen always shows the address the application comes from, apart from the name it gives itself, and never loads its logo. Turning it off stops new sign-ins of such applications; existing grants keep working until revoked. |
+| `LACHESIS_PROBE_INTERVAL_MINUTES`, `LACHESIS_DRIFT_CHECK_INTERVAL_MINUTES`, `LACHESIS_METRICS_ENABLED`, `LACHESIS_METRICS_TOKEN_FILE` | Background checks and Prometheus metrics (section 7.4b). All four can also be set on the Settings page, group Monitoring; setting the variable locks the setting there. |
 | `LACHESIS_SECRET_REF_DIRS`, `LACHESIS_SECRET_REF_ENV_PREFIX` | Which `file://` and `env://` secret references may resolve (section 8). Unset, file references are off and env references need the `LACHESIS_REF_` prefix. |
 
 **Settings you can change in the browser.** Fourteen of these variables are also editable by administrators on
@@ -380,6 +381,56 @@ LACHESIS_APPROVAL_WEBHOOK_SECRET_FILE=/run/secrets/lachesis_approval_webhook_sec
   URL, so private ranges are allowed. Loopback, link-local (cloud metadata included) and the unspecified address are
   refused unless their network is in `LACHESIS_EGRESS_ALLOW`. Failed deliveries are retried three times and then
   audited (`plan.webhook`), repeated failures as one summary row per five minutes.
+
+### 7.4b Monitoring: background probe, drift check and metrics
+
+Three settings (Settings page, group Monitoring; each has an environment variable that locks it):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Background probe interval (`LACHESIS_PROBE_INTERVAL_MINUTES`) | 5 minutes | Lachesis probes every server on this interval (read only, spread over the interval, four at a time at most, never while a change is being applied to that server). `0` turns it off; otherwise 5 minutes or more. A probe older than three intervals (a day when this is off) is shown as **Stale** ("Stale, last check failed" when the last result was a failure) instead of "Reachable". **A probe is a sign-in.** A server that refuses the sign-in (a rotated or disabled service account) is left alone from then on: it shows "Background checks paused: sign-in failed" until you change its credentials or a person probes it successfully, so a bad password is not retried every interval. A server that is down or failing otherwise is tried less often (the interval times 2, 4, 8, up to an hour) until it answers. Even so, many servers that share one directory account (the Windows adapter signs in with a domain account), probed on a short interval, can add up to a lockout: keep the interval long, or give each server its own account. |
+| Scheduled drift check interval (`LACHESIS_DRIFT_CHECK_INTERVAL_MINUTES`) | `0` (off) | Compare failover pairs on this interval (5 minutes or more). Off by default so that upgrading does not start reading every pair and sending messages. A cycle compares at most 50 pairs, starting where the last one stopped (with more pairs, each is compared every ceil(pairs / 50) intervals), and ends after four fifths of the interval. A pair that goes out of sync, comes back, or cannot be compared is announced when the new state has held for two checks in a row and the pair was not announced in the last hour (a pair that flips every check sends nothing until it settles, and the message then says how many `flips` it went through). An announcement writes one audit row (`drift.state_changed`) and, if the approval webhook is set up (section 7.4a), sends one signed `drift.changed` message: `event`, `servers` (the two names), `state`, `previous`, `differences`, `flips` (when not 0) and a `link`. **It has no `plan_id`: a receiver must branch on `event`** (`plan.pending_approval`, `plan.rejected` or `drift.changed`). The first check of a pair only records its state, so a pair that is already drifted when you turn this on does not notify; and turning the webhook on later does not replay earlier changes. |
+| Prometheus metrics (`LACHESIS_METRICS_ENABLED`, `LACHESIS_METRICS_TOKEN_FILE`) | off | `GET /metrics`. It answers 404 until enabled, and then needs the metrics token as a bearer token: set it on the Settings page (write-only), or point `LACHESIS_METRICS_TOKEN_FILE` at a chmod 600 file. **At least 32 characters either way** (`openssl rand -hex 32`); a shorter token in the file counts as no token and is logged once. Lachesis refuses to enable the endpoint on the page without a token; enabled from the environment without one it logs a warning at start and refuses every request. A rotated token file is picked up within about 10 seconds, no restart. An API token does not work there and the metrics token works nowhere else. |
+
+With several instances of the app behind one database, only one of them runs the probe loop and the drift
+check at a time (a PostgreSQL advisory lock), so the load on your servers does not grow with the number of
+instances. A running cycle checks every few seconds, and before each probe, that its instance still leads; when the
+lock moves, the old leader stops within seconds and another takes over within about 30 seconds. Requirements:
+
+- Connect to PostgreSQL directly or through a proxy in **session** pooling mode. A transaction-pooling proxy
+  (PgBouncer's `pool_mode = transaction`) breaks session advisory locks, the master-key lock that already protects
+  key rotation included.
+- Two Lachesis deployments must not share one database: the lock is database-wide, so only one of them would run
+  its background checks.
+- The leader keeps one database connection for as long as it runs, as the master-key lock does. The default
+  pool (the larger of 4 and the number of CPUs) has room; if you set `pool_max_conns` in `DATABASE_URL`, keep it at
+  6 or more.
+
+Every instance serves `/metrics` and reports the same server and drift values (they come from the database); the
+request counters are per instance, so scrape every instance, or sum over them.
+
+Scrape it from Prometheus (the token is a placeholder; keep it in a file):
+
+```yaml
+scrape_configs:
+  - job_name: lachesis
+    scheme: https
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/lachesis-metrics-token   # chmod 600, the token you set in Lachesis
+    scrape_interval: 60s
+    static_configs:
+      - targets: ["lachesis.example.com"]
+```
+
+Series (labels are only those shown; no addresses, user names or token ids): `lachesis_build_info{version,commit}`,
+`lachesis_server_reachable{server}`, `lachesis_server_last_probe_age_seconds{server}`, `lachesis_server_probe_stale{server}`, `lachesis_server_background_paused{server}`,
+`lachesis_plans{status}`, `lachesis_drift_pair_state{pair,state}`, `lachesis_drift_pair_differences{pair}`,
+`lachesis_background_last_run_timestamp_seconds{loop}`, `lachesis_http_requests_total{route,class}` and
+`lachesis_http_request_duration_seconds{route,class}`. Server and pair labels are the server names you chose. A
+useful alert: `lachesis_server_probe_stale == 1`, or `time() - lachesis_background_last_run_timestamp_seconds{loop="probe"} > 900`.
+Only failed requests count against the per-address limit (20, then one every 3 seconds), so a client sharing the scraper's address cannot lock the scraper out; at most four scrapes run at once. Keep the scrape interval at 15 s or more.
 
 ### 7.5 Sessions
 
