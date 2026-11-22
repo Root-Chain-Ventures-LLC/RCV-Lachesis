@@ -3,9 +3,11 @@
 The UniFi Network application: a self-hosted Network Server, or the Network application of a UniFi OS console.
 Vendor id `unifi`. IPv4 only.
 
-**Validated:** a self-hosted Network Server with a local account (UniFi Network 10.6.109). **Experimental, not validated on a real
-console:** the UniFi OS console mode and API keys, and any role name other than `admin`. Validating the UniFi OS console mode is a
-tracked follow-up; the official integration API is not used.
+**Validated:** a self-hosted Network Server with a local account (UniFi Network 10.6.109), and the **UniFi OS console mode**
+on **UniFi OS Server 5.1.42 with Network 10.5.67**: console login with its anti-forgery token, an API key, the owner
+account and a View Only account. **Not validated** (the test console has no adopted device and no gateway): a gateway that serves
+DHCP and honours a fixed IP, a hardware console (UDM, UCG, Cloud Key; the software is the same family, the box was not tested),
+roles other than the owner and View Only, and other versions. The official integration API is probed but not used.
 
 A UniFi **network** is the scope. Its DHCP range is the pool, its DHCP settings are scope options, the known clients
 with a fixed IP are the reservations and the clients the controller currently sees are the leases. One Lachesis
@@ -17,46 +19,92 @@ The controller offers two API surfaces. The adapter uses the classic one.
 
 | | Classic API (`/api/s/<site>/rest\|stat/...`) | Official integration API (`/integration/v1/...`) |
 |---|---|---|
-| Authentication | Local account: `POST /api/login`, session cookie (a UniFi OS console: `POST /api/auth/login`, cookie plus `X-CSRF-Token`). An API key (`X-API-KEY`) is also sent on a UniFi OS console. | `X-API-KEY` only |
-| Can it be used on a self-hosted Network Server? | Yes, tested | Present, but no key can be created: not tested |
-| Networks, DHCP range and options | read and write (`rest/networkconf`), tested | not exercised |
-| Fixed IPs | read and write (`rest/user`), tested | not exercised |
-| Clients | `stat/sta` (connected, synthetic in the fixtures), `rest/user` (known) | not exercised |
+| Authentication | Local account: `POST /api/login`, session cookie (a UniFi OS console: `POST /api/auth/login`, `TOKEN` cookie plus `X-Csrf-Token`). An API key (`X-API-KEY`) also works on a console. | `X-API-KEY` only (a console login session is refused: 401 `api.authentication.missing-credentials`) |
+| Can it be used on a self-hosted Network Server? | Yes, tested | Present, but no key can be created there |
+| Networks, DHCP range and options | read and write (`rest/networkconf`), tested on both | `GET .../networks[/<id>]` reads range, gateway, DNS, lease time and domain; **writes were refused** on the test console (`api.network.validation.gateway-not-found-on-site`: no gateway adopted) |
+| Fixed IPs | read and write (`rest/user`), tested on both | **none** (no reservation endpoint; `404 No endpoint`) |
+| Clients and leases | `stat/sta` (connected, synthetic in the fixtures), `rest/user` (known) | read-only list of connected clients; no leases |
 
-Verified on UniFi Network **10.6.109** (a self-hosted Network Server in a container, no devices adopted):
+Verified on **UniFi Network 10.6.109** (a self-hosted Network Server in a container, no devices adopted):
 
 - `/integration/v1/info` answers 403 `api.forbidden` without a key, and also with a made-up key. The server has the surface
   but **cannot mint a key**: Settings > System has General and Backups only, there is no Control Plane or Integrations
-  page, and no cookie-authenticated call creates one. Keys are a UniFi OS console feature, so the integration API could
-  not be exercised at all, and whether it covers fixed IPs and DHCP settings is not known from this work.
+  page, and no cookie-authenticated call creates one. Keys are a UniFi OS console feature.
 - The classic API reads and writes everything Lachesis manages, with a local account.
 
-Probe reports the surface it found (`Details["api_surface"]`, and `Details["integration_api"]`: `present (needs an API
-key; not used)` or `absent`, found by asking without credentials). **A UniFi OS console with an API key** is supported
-through the classic paths under `/proxy/network` (set the controller type to UniFi OS and give an `api_key`); that mode is **experimental**; it,
-and the console login with its CSRF token, follow the documented behaviour of those consoles and are covered by tests
-against a stand-in, **not against a real console** (see "What is not validated").
+Verified on **UniFi OS Server 5.1.42 / Network 10.5.67** (a console in a VM, no devices, no gateway, local owner account only):
+
+- An API key authenticates the classic paths: `GET /proxy/network/api/s/<site>/rest/networkconf` with `X-API-KEY` answers 200, and
+  writes (`PUT rest/networkconf/<id>`, `POST rest/user`, `PUT rest/user/<id>`, the `sitemgr` command) work the same, with **no CSRF token**. The
+  unprefixed `/api/s/<site>/...` is a 404 on a console: the `/proxy/network` prefix is required.
+- The integration API (`/proxy/network/integration/v1`) answers `GET /info` (`{"applicationVersion":"10.5.67"}`), `/sites`, `/sites/<id>/networks`,
+  `/networks/<id>`, `/clients`, `/devices`, `/wifi/broadcasts`, `/dns/policies`. A network carries `ipv4Configuration.dhcpConfiguration`
+  (`mode` `SERVER`, `ipAddressRange` start/stop, `gatewayIpAddressOverride`, `dnsServerIpAddressesOverride`, `leaseTimeSeconds`, `domainName`,
+  `pingConflictDetectionEnabled`) but no NTP, WINS, TFTP or WPAD option. There is **no fixed-IP or lease endpoint**. `PUT` of a network was refused
+  here twice: first `api.network.validation.ipv4.subnet-not-private` ("Auto-scale requires private subnet": a documentation range), then
+  `api.network.validation.gateway-not-found-on-site` with auto-scale off; whether it writes with an adopted gateway is **not validated**.
+  Without a key or with a wrong key: 401 `{"error":{"code":401,"message":"Unauthorized"}}`. So the integration API covers a subset of
+  the DHCP reads (range, gateway, DNS, lease time, domain) and none of the fixed IPs, and Lachesis keeps using the classic paths for everything.
+
+Probe reports the surface it found (`Details["api_surface"]`, `Details["auth"]` on a console: `console login` or `API key`, and
+`Details["integration_api"]`: `present (needs an API key; not used: no fixed IPs or leases)` or `absent`, found by asking without credentials).
+A UniFi OS console is selected with the controller type `UniFi OS` (`platform: unifi_os`).
 
 ## Credentials (least privilege)
 
 | Secret | Use |
 |---|---|
 | `username` + `password` | A local controller account. The adapter logs in when the session starts and logs out when it closes. |
-| `api_key` | A UniFi OS console API key (Settings > Control Plane > Integrations), sent as `X-API-KEY`. |
+| `api_key` | A UniFi OS console API key (Network > Integrations > Create New API Key), sent as `X-API-KEY`. |
 
 Give Lachesis its own **local** account: no UI/cloud sign-in, MFA off (a cookie login cannot answer a second factor), no
-remote access. Role: Administrator on the one site (or a Site Administrator limited to it). A read-only role can read; Probe
-sees the role the site reports and marks every write capability unavailable with the reason (Probe also warns whenever the UniFi OS or API-key mode is in use; the role names `readonly`,
-`nonadmin` and `hotspot` are taken from the controller's documented roles and are **unvalidated**; only `admin` was seen).
+remote access. Role: Administrator on the one site. **Prefer an API key on a UniFi OS console** (below: the console limits logins).
+
+**An API key has the permissions of the account that created it.** On UniFi OS Server there is no read-only key: the limited
+administrator cannot create one (`CODE_UNAUTHORIZED`) and the owner cannot create one for it (`CODE_OPERATION_FORBIDDEN`). A key
+created by the owner can write everything, so keep it as secret as the owner's password; delete it with the console when it is no longer needed.
+
+**Roles on UniFi OS Server 5.1.42** (Admins & Users > Create New > Admin > untick "Use a Predefined Role"): the Network application's
+selector offers Full Management, Hotspot Operator, **View Only**, **Site Admin** and None; the user-management selector Full Management, View Only
+and None. The console stores a custom role with `network.management: ["readonly"]` (View Only) or `["s-<site id>-admin"]` (Site Admin).
+What the Network application then reports for the account on the site (`GET /proxy/network/api/self/sites`, field `role`):
+
+- owner (and an owner's API key): `admin`, everything works;
+- **View Only: `readonly`**, reads work (`rest/networkconf`, `rest/user`, `stat/*`) and every write is refused by the console itself with
+  **HTTP 403** `{"meta":{"rc":"error","msg":"api.err.NoPermission"},"data":[]}`. Probe sees `readonly` and marks `reservations.write`, `pools.write`
+  and `options.write` unavailable with the reason; a write sent anyway (a stale stored capability) is `ErrAuthFailed` and changes nothing. Both tested.
+- Site Admin and Hotspot Operator could not be checked: **a console login only worked for one of the four limited accounts created**. The account
+  with Network View Only and user management **View Only** signed in; accounts with user management None, Full Management or a Site Admin
+  network role were refused at login with `403 AUTHENTICATION_FAILED_ACCOUNT_NOT_EXIST_LOCALLY` ("You do not have the permission to access this
+  device"), although they were created as local accounts and listed as active. The reason is not known. The adapter reports that answer as
+  `ErrAuthFailed` with a hint (use a local account that may sign in, or an API key). The role names `readonly` (seen), `nonadmin` and `hotspot`
+  (documented, not seen) are mapped; only `admin` and `readonly` were observed.
 
 Sessions and logins:
 
-- A wrong password is `ErrAuthFailed` (a Network Server answers it with HTTP 400, a console with 401), too many logins is `ErrBusy`
-  with the controller's `Retry-After` (seconds; default 60; clamped to 300). **The first `AuthFailed` or `Busy` login is latched
-  for the rest of the session**: every later call returns it without contacting the controller, so a wrong password costs one failed
+- A wrong password is `ErrAuthFailed` (a Network Server answers HTTP 400 `api.err.Invalid`; **a UniFi OS console answers HTTP 403
+  `{"code":"AUTHENTICATION_FAILED_INVALID_CREDENTIALS","message":"Invalid username or password","level":"debug"}`**). Too many logins is
+  `ErrBusy` with the controller's `Retry-After` (seconds; default 60; clamped to 300). **A UniFi OS console limits logins**: on UniFi OS Server 5.1.42
+  four logins in quick succession were accepted and the fifth was answered **429 `AUTHENTICATION_FAILED_LIMIT_REACHED`** ("You've reached the login
+  attempt limit") with **no `Retry-After`**, and the limit also counts logins that succeeded; it cleared after roughly a minute without attempts
+  (polling every 10 seconds kept it shut). Lachesis opens a session, and so logs in, for each operation (a probe, a read, each step of a plan), so a busy
+  console login runs into it: use an API key. The first `AuthFailed` or `Busy` login is latched
+  for the rest of the session: every later call returns it without contacting the controller, so a wrong password costs one failed
   login, not one per call.
 - A session logs in at most **twice** (the first login and one renewal after the controller drops the session; a 401 means the
   request was not processed, so it is retried once). After that the session is `AuthFailed`.
+- **Console login and CSRF (observed):** `POST /api/auth/login` with `{"username","password","remember"}` (the console's own UI sends
+  `{"username","password","token":"","rememberMe":false}`; both work) answers 200 with the user record, a `TOKEN` cookie (a JWT, `Secure; HttpOnly;
+  SameSite=None; Partitioned`, **two hours**; the header `x-token-expire-time` is the expiry in milliseconds) and the anti-forgery token in the
+  **response header `X-Csrf-Token`** (there is no `csrf_token` cookie). `X-Updated-Csrf-Token` was not seen. Writes with the cookie go with
+  `X-Csrf-Token: <token>`; a **wrong** token is the console's own `HTTP 403 {"error":{"code":403,"message":"Forbidden"}}` (no Network envelope);
+  a write with **no** token header was accepted by this build (it reached validation). The adapter always sends the token, and treats that 403
+  like a 401: one renewal login, then `ErrAuthFailed`. Reads need no token.
+- **Session expiry and errors:** a missing, bogus, logged-out or expired session, and a missing or wrong API key, all answer
+  `HTTP 401 {"error":{"code":401,"message":"Unauthorized"}}` (not the Network `api.err.LoginRequired` envelope of a Network Server); after
+  `POST /api/auth/logout` (200 `{"success":true}`) the same cookie is a 401. A site the Network application does not know is
+  **401** `api.err.NoSiteContext` (with a Network envelope), which the adapter reports as `ErrInvalidInput`. Validation errors are the Network
+  Server's: 400 `api.err.InvalidPayload` with the failing field.
 - Only the cookies `unifises`, `TOKEN` and `csrf_token` are kept, at most 4, each at most 4 KiB; the CSRF token (header or cookie) is kept only
   if it is printable ASCII of at most 512 characters. Cookies and the key go only to the configured base URL; redirects are not followed.
 - A refusal to a logged-in account (no permission) is `ErrAuthFailed`.
@@ -82,17 +130,32 @@ Skipping verification is the per-server, audited, permanently badged override of
 | Field | Default | Meaning |
 |---|---|---|
 | `site` | `default` | The site's name (`default`, or the short id the controller gave a site added later) **or** its description as the UI shows it. A description that two sites share is refused. |
-| `platform` | `controller` | `controller`: a Network Server, `/api/login`, paths at the root. `unifi_os`: a console, `/api/auth/login` or an API key, paths under `/proxy/network` (**experimental, not validated on a real console**). |
+| `platform` | `controller` | `controller`: a Network Server, `/api/login`, paths at the root. `unifi_os`: a console, `/api/auth/login` or an API key, paths under `/proxy/network` (validated on UniFi OS Server 5.1.42; a gateway and a hardware console are not). |
 | `max_items` | 200000 | The most clients or networks one read accepts; one answer may not exceed 32 MiB. |
 
 ## Probe
 
-Probe asks `/integration/v1/info` and `/status` without credentials (surface and version), logs in, resolves the site, and
-reads `stat/device-basic`. It reports the version (`10.6.109`), `Details`: `platform`, `site` (the internal name), `api_surface`,
-`integration_api`, `gateways`; and warns when **no UniFi gateway (USG, UDM, UXG) is adopted** on the site: the controller stores
+Probe asks `/integration/v1/info` and `/status` without credentials (surface and version; on a console both answer 401, so the
+version comes from the site's `stat/sysinfo` after the login), logs in, resolves the site, and
+reads `stat/device-basic`. It reports the version (`10.6.109`, `10.5.67`), `Details`: `platform`, `site` (the internal name), `api_surface`,
+`auth` (a console: `console login` or `API key`), `integration_api`, `gateways`; and warns when **no UniFi gateway (USG, UDM, UXG) is adopted** on the site: the controller stores
 DHCP settings but a third-party router then serves the addresses, so changes made here may not reach any client. A site that
 does not exist, or that two sites claim, is a probe that answers but is unusable (`OK=false`, every capability unavailable with
 the reason).
+
+Warnings per mode (what a probe says so the operator is not misled):
+
+| Mode | Warnings |
+|---|---|
+| Network Server, local account | the gateway warning, when it applies |
+| UniFi OS, API key or console login | "validated on UniFi OS Server 5.1.42 (Network 10.5.67) ...; a UniFi gateway or hardware console, other roles (for example Site Admin) and other versions are not validated", and the gateway warning |
+| UniFi OS, console login only | also: "a UniFi OS console limits logins (about four a minute; the fifth is answered 429) ... use an API key" |
+| a read-only account (any mode) | the write capabilities are unavailable, reason "the account's role on this site (readonly) cannot change settings" |
+
+Capabilities do not differ between the modes: all of `scopes.read`, `leases.read`, `reservations.read`, `reservations.write`, `pools.write`
+and `options.write` are `classic` for a writable account, and only the account's site role (`readonly`, `nonadmin`, `hotspot`) takes the
+writes away. They are **not** switched off for lack of a gateway: the console stores and verifies the settings either way, and the warning
+says whether anything serves them.
 
 ## Capabilities
 
@@ -169,11 +232,14 @@ in the log (counts only) and Preflight adds a warning with the number. One bad r
 
 ## What is not validated
 
-- The official integration API (`/integration/v1`): the test controller cannot mint a key; not used.
-- A UniFi OS console, the API-key mode and the console login/CSRF flow: **experimental**, implemented from the documented behaviour,
-  tested only against a stand-in. Role names other than `admin` are likewise unvalidated. Validating them on a real console is a tracked
-  follow-up; the integration API is not used.
-- Behaviour with an adopted gateway: the test controller has no devices, so DHCP is not actually served and the connected
-  client list is synthetic.
-- Other Network versions: only 10.6.109 was exercised. Field names are the classic API's long-standing ones; numbers the
-  controller sends as strings (a VLAN id) are read both ways.
+- **A gateway that serves DHCP** (a USG, UDM, UXG or Cloud Gateway): the test consoles have no devices, so whether the gateway applies a
+  range, an option or a fixed IP inside the range, and what its leases look like, is not known. The connected client list is synthetic in the
+  fixtures (the console has no clients). Probe warns when no gateway is adopted.
+- A **hardware UniFi OS console** (UDM, UCG, Cloud Key Gen2+): the UniFi OS **Server** software was tested (5.1.42, Network 10.5.67);
+  a hardware console runs the same console software but was not tested, and the Network version differs from the self-hosted 10.6.109.
+- **Roles** other than the owner (`admin`) and View Only (`readonly`): Site Admin and Hotspot Operator accounts could not sign in on the test console
+  (above), so what they report and may do is unknown.
+- The **integration API**: reads of networks are known (above), but its writes were refused without a gateway and it has no fixed IPs, so it is not used.
+- A **read-only API key** cannot be created on UniFi OS Server, so the key mode was exercised with an owner key only.
+- Other Network versions: 10.6.109 (Network Server) and 10.5.67 (UniFi OS Server) were exercised. Field names are the classic API's
+  long-standing ones; numbers the controller sends as strings (a VLAN id) are read both ways.

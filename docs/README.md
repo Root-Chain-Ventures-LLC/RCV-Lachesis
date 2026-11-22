@@ -3,6 +3,8 @@
 | Topic | Page | What is in it |
 |---|---|---|
 | Installing and upgrading | [`install.md`](install.md) | Requirements, `.env`, the master key and its rotation, where the port is published, the reverse proxy and `TRUST_PROXY`, starting and upgrading, backups and rollback, first administrator, single sign-on, local accounts, roles, sessions, API tokens, database roles, audit retention, secret references |
+| HTTP API | [`api.md`](api.md) | Authentication (Bearer and X-Api-Key), a token's authority and the capability table, the error body, paging and limits, the plan, approve, apply path, the OpenAPI document, discovery and `/llms.txt` |
+| MCP server | [`mcp.md`](mcp.md) | The stateless endpoint, authentication, tools with their read-only and destructive annotations, untrusted content, plan and apply over MCP, errors, audit, resources, prompts and the stdio bridge |
 | Kea adapter | [`adapters/kea.md`](adapters/kea.md) | ISC Kea DHCPv4: control API and credentials, what Probe reports, write modes, capabilities, high-availability pairs and vendor quirks |
 | Windows adapter | [`adapters/windows.md`](adapters/windows.md) | Windows Server DHCP over WinRM/PSRP: least-privilege account and JEA endpoint, TLS pinning, failover sync modes, capabilities and vendor quirks |
 | VyOS adapter | [`adapters/vyos.md`](adapters/vyos.md) | VyOS 1.4 and later over the HTTPS API: API key, TLS pinning, high-availability pairs, commit and save, lease time zones, capabilities and vendor quirks |
